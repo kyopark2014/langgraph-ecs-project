@@ -3,6 +3,7 @@ streamlit-chat
 streamlit-paste-button
 boto3>=1.43.32
 botocore>=1.43.32
+bedrock-agentcore
 langchain_aws
 langchain
 langchain_community

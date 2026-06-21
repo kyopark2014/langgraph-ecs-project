@@ -27,7 +27,27 @@ config = utils.load_config()
 sharing_url = config.get("sharing_url")
 
 # title
-st.set_page_config(page_title='agent-skills', page_icon=None, layout="centered", initial_sidebar_state="auto", menu_items=None)
+st.set_page_config(page_title='ECS', page_icon=None, layout="centered", initial_sidebar_state="auto", menu_items=None)
+
+
+@st.dialog("User ID 입력")
+def request_user_id() -> None:
+    st.markdown("시작하려면 User ID를 입력하세요.")
+    user_id = st.text_input("User ID", key="user_id_input", placeholder="예: user01")
+    if st.button("시작", type="primary", use_container_width=True):
+        if user_id.strip():
+            st.session_state.user_id = user_id.strip()
+            chat.set_user_id(user_id.strip())
+            st.rerun()
+        else:
+            st.error("User ID를 입력해주세요.")
+
+
+if not st.session_state.get("user_id"):
+    request_user_id()
+    st.stop()
+
+chat.set_user_id(st.session_state.user_id)
 
 mode_descriptions = {
     "일상적인 대화": [
@@ -57,7 +77,7 @@ with st.sidebar:
         "Amazon Bedrock을 이용해 다양한 형태의 대화를 구현합니다." 
         "여기에서는 SKILL과 MCP를 이용해 agent의 기능을 확장합니다." 
         "주요 코드는 LangGraph를 이용해 구현되었습니다.\n"
-        "상세한 코드는 [Github](https://github.com/kyopark2014/agent-skills)을 참조하세요."
+        "상세한 코드는 [Github](https://github.com/kyopark2014/langgraph-ecs-project)을 참조하세요."
     )
 
     st.subheader("🐱 대화 형태")
@@ -67,8 +87,10 @@ with st.sidebar:
         label="원하는 대화 형태를 선택하세요. ",options=["일상적인 대화", "RAG", "Agent", "Agent (Chat)", "이미지 분석", "번역하기"], index=3
     )   
     st.info(mode_descriptions[mode][0])
+
+    st.caption(f"User ID: {st.session_state.user_id}")
     
-    # mcp selection    
+    # mcp selection
     mcp_options = [
         "use-aws", 
         "websearch",        
@@ -80,6 +102,8 @@ with st.sidebar:
         "text_extraction",
         "korea_weather",
         "image_generation",
+        "short term memory",
+        "long term memory",        
         "사용자 설정"
     ]    
     if mode=='Agent' or mode=='Agent (Chat)':
@@ -108,7 +132,7 @@ with st.sidebar:
 
         # Change radio to checkbox        
         mcp_selections = {}
-        default_selections = ["web_fetch", "slack", "notion", "korea_weather", "websearch"]
+        default_selections = ["long term memory", "web_fetch", "slack", "notion", "korea_weather", "websearch"]
         
         with st.expander("MCP 옵션 선택", expanded=True):
             for option in mcp_options:
@@ -189,6 +213,10 @@ with st.sidebar:
     debugMode = 'Enable' if select_debugMode else 'Disable'
     #print('debugMode: ', debugMode)
 
+    # Memory
+    enable_memory = st.checkbox('Memory', value=True)
+    memoryMode = 'Enable' if enable_memory else 'Disable'
+
     # extended thinking of claude 3.7 sonnet
     reasoningMode = "Disable"
     if mode == "일상적인 대화" or mode == "RAG":
@@ -216,7 +244,7 @@ with st.sidebar:
         st.markdown("**또는** 화면 캡처를 붙여넣으세요:")
         pasted_image = safe_paste_button("📋 클립보드에서 붙여넣기", key="paste_image")
         
-    chat.update(modelName, debugMode, reasoningMode, skillMode)    
+    chat.update(modelName, debugMode, reasoningMode, skillMode, memoryMode)    
 
     st.success(f"Connected to {modelName}", icon="💚")
     clear_button = st.button("대화 초기화", key="clear")
@@ -390,6 +418,9 @@ if prompt := st.chat_input("메시지를 입력하세요."):
                 logger.info(f"url: {url}")
                 file_name = url[url.rfind('/')+1:]
                 st.image(url, caption=file_name, use_container_width=True)
+
+            if memoryMode == "Enable":
+                chat.save_to_memory(prompt, response)
 
         elif mode == '번역하기':
             response = chat.translate_text(prompt)

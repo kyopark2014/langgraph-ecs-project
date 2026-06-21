@@ -91,8 +91,12 @@ def load_config(mcp_type):
         mcp_type = "aws_slack"
     elif mcp_type == "AWS Loop (Employee)":
         mcp_type = "aws_loop"
+    elif mcp_type == "short term memory":
+        mcp_type = "short-term-memory"
+    elif mcp_type == "long term memory":
+        mcp_type = "long-term-memory"
 
-    if mcp_type == "use-aws": 
+    if mcp_type == "use-aws":
         return {
             "mcpServers": {
                 "use-aws": {
@@ -190,7 +194,27 @@ def load_config(mcp_type):
                 }
             }
         }
-    
+
+    elif mcp_type == "short-term-memory":
+        return {
+            "mcpServers": {
+                "short-term memory": {
+                    "command": "python",
+                    "args": [f"{workingDir}/mcp_server_short_term_memory.py"]
+                }
+            }
+        }
+
+    elif mcp_type == "long-term-memory":
+        return {
+            "mcpServers": {
+                "long-term memory": {
+                    "command": "python",
+                    "args": [f"{workingDir}/mcp_server_long_term_memory.py"]
+                }
+            }
+        }
+
     elif mcp_type == "websearch":
         gateway_url = get_agentcore_gateway_mcp_url("gateway-websearch", "us-east-1")
         if not gateway_url:

@@ -123,9 +123,12 @@ def get_contents_type(file_name):
 def load_mcp_env():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     mcp_env_path = os.path.join(script_dir, "mcp.env")
-    
-    with open(mcp_env_path, "r", encoding="utf-8") as f:
-        mcp_env = json.load(f)
+
+    try:
+        with open(mcp_env_path, "r", encoding="utf-8") as f:
+            mcp_env = json.load(f)
+    except FileNotFoundError:
+        mcp_env = {"user_id": "agent"}
     return mcp_env
 
 def save_mcp_env(mcp_env):
