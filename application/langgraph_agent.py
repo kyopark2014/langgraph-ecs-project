@@ -943,6 +943,34 @@ def buildChatAgentWithHistory(tools):
 # ═══════════════════════════════════════════════════════════════════
 #  MCP Server Utilities
 # ═══════════════════════════════════════════════════════════════════
+_MCP_SUBPROCESS_ENV_KEYS = frozenset({
+    "TAVILY_API_KEY",
+    "NOTION_API_KEY",
+    "SLACK_BOT_TOKEN",
+    "SLACK_TEAM_ID",
+    "TELEGRAM_API_KEY",
+    "DISCORD_BOT_TOKEN",
+    "APP_CONFIG_JSON",
+})
+
+
+def _build_mcp_subprocess_env(extra_env: dict | None = None) -> dict[str, str]:
+    """Propagate ECS task credentials and API keys to MCP stdio subprocesses.
+
+    MCP stdio transport only inherits a minimal PATH/HOME subset by default, so
+    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI and other runtime env vars must be
+    forwarded explicitly for boto3 calls inside MCP servers.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("AWS_") or key in _MCP_SUBPROCESS_ENV_KEYS
+    }
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
 def load_multiple_mcp_server_parameters(mcp_json: dict):
     mcpServers = mcp_json.get("mcpServers")
 
@@ -966,7 +994,7 @@ def load_multiple_mcp_server_parameters(mcp_json: dict):
                     "transport": "stdio",
                     "command": cfg.get("command", ""),
                     "args": cfg.get("args", []),
-                    "env": cfg.get("env", {})
+                    "env": _build_mcp_subprocess_env(cfg.get("env")),
                 }
     return server_info
 
