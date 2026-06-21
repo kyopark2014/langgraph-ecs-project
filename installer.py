@@ -2818,22 +2818,35 @@ def create_agentcore_memory_role() -> str:
     """Create AgentCore Memory IAM role."""
     logger.info("[3/10] Creating AgentCore Memory IAM role")
     role_name = f"role-agentcore-memory-for-{project_name}-{region}"
-    
+
+    # Trust policy must include SourceAccount and SourceArn conditions.
+    # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/long-term-configuring-custom-strategies.html
     assume_role_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
+                "Sid": "MemoryAssumeRolePolicy",
                 "Effect": "Allow",
                 "Principal": {
                     "Service": "bedrock-agentcore.amazonaws.com"
                 },
-                "Action": "sts:AssumeRole"
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:SourceAccount": account_id
+                    },
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock-agentcore:{region}:{account_id}:*"
+                        )
+                    },
+                },
             }
         ]
     }
-    
+
     role_arn = create_iam_role(role_name, assume_role_policy)
-    
+
     memory_policy = {
         "Version": "2012-10-17",
         "Statement": [
@@ -2842,26 +2855,21 @@ def create_agentcore_memory_role() -> str:
                 "Action": [
                     "bedrock:InvokeModel",
                     "bedrock:InvokeModelWithResponseStream",
-                    "bedrock:ListMemories",
-                    "bedrock:CreateMemory",
-                    "bedrock:DeleteMemory",
-                    "bedrock:DescribeMemory",
-                    "bedrock:UpdateMemory",
-                    "bedrock:ListMemoryRecords",
-                    "bedrock:CreateMemoryRecord",
-                    "bedrock:DeleteMemoryRecord",
-                    "bedrock:DescribeMemoryRecord",
-                    "bedrock:UpdateMemoryRecord"
                 ],
                 "Resource": [
                     "arn:aws:bedrock:*::foundation-model/*",
                     "arn:aws:bedrock:*:*:inference-profile/*"
-                ]
+                ],
+                "Condition": {
+                    "StringEquals": {
+                        "aws:ResourceAccount": account_id
+                    }
+                },
             }
         ]
     }
     attach_inline_policy(role_name, f"agentcore-memory-policy-for-{project_name}", memory_policy)
-    
+
     return role_arn
 
 
