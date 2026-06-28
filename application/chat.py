@@ -1,4 +1,7 @@
 import traceback
+import asyncio
+import shutil
+import sqlite3
 import boto3
 import os
 import json
@@ -25,6 +28,14 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMess
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import MemorySaver
+
+try:
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    SQLITE_CHECKPOINTER_AVAILABLE = True
+except ImportError:
+    AsyncSqliteSaver = None  # type: ignore[misc, assignment]
+    SQLITE_CHECKPOINTER_AVAILABLE = False
+
 from langgraph.store.memory import InMemoryStore
 
 import logging
@@ -138,35 +149,295 @@ def update(modelName, debugMode, reasoningMode, skillMode, memoryMode="Disable")
 
     # logger.info(f"mcp.env updated: {mcp_env}")
 
-map_chain = dict() 
-checkpointers = dict() 
-memorystores = dict() 
+
+def _resolve_session_storage_dir() -> str:
+    env_dir = os.environ.get("SESSION_STORAGE_DIR", "").strip()
+    if env_dir:
+        return env_dir.rstrip("/")
+    mount_path = config.get("s3_files_mount_path")
+    if mount_path:
+        return str(mount_path).rstrip("/")
+    if os.path.isdir("/mnt/workspace"):
+        return "/mnt/workspace"
+    return os.path.join(workingDir, ".session_storage")
+
+
+SESSION_STORAGE_DIR = _resolve_session_storage_dir()
+LEGACY_CHECKPOINT_DB = os.path.join(SESSION_STORAGE_DIR, "langgraph_checkpoints.sqlite")
+
+checkpointer = MemorySaver()
+_sqlite_checkpointer = None
+_sqlite_checkpointer_cm = None
+_active_checkpoint_session = None
+_checkpointer_init_lock = asyncio.Lock()
+SQLITE_BUSY_TIMEOUT_MS = 5000
+_SETUP_MAX_ATTEMPTS = 5
+_SETUP_RETRY_BASE_SEC = 0.25
+
+
+def _runtime_session_id() -> str | None:
+    try:
+        from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+
+        return BedrockAgentCoreContext.get_session_id()
+    except Exception:
+        return None
+
+
+def _checkpoint_session_id() -> str:
+    session_id = _runtime_session_id()
+    if session_id:
+        return session_id
+    effective_user_id = user_id if user_id and str(user_id).strip() else "agent"
+    return re.sub(r"[^\w\-.]", "_", effective_user_id)
+
+
+def get_checkpoint_db_path() -> str:
+    """Working SQLite path on local disk (avoids NFS locking during runtime)."""
+    session_id = _checkpoint_session_id()
+    local_dir = os.path.join("/tmp", "langgraph-checkpoints", session_id)
+    os.makedirs(local_dir, exist_ok=True)
+    return os.path.join(local_dir, "langgraph_checkpoints.sqlite")
+
+
+def get_persistent_checkpoint_db_path() -> str:
+    """Durable checkpoint path on S3 Files mount (/mnt/workspace)."""
+    if _runtime_session_id():
+        return LEGACY_CHECKPOINT_DB
+    user_dir = os.path.join(SESSION_STORAGE_DIR, _checkpoint_session_id())
+    return os.path.join(user_dir, "langgraph_checkpoints.sqlite")
+
+
+def _restore_from_session_storage(working_db: str) -> None:
+    """Copy durable checkpoint from session storage into the local working DB."""
+    persistent = get_persistent_checkpoint_db_path()
+    if working_db == persistent:
+        return
+
+    if not _checkpoint_db_ready(persistent):
+        if os.path.isfile(persistent):
+            logger.warning(
+                f"Persistent checkpoint empty, skip restore: {persistent} "
+                f"(size={os.path.getsize(persistent)})"
+            )
+        elif os.path.isdir(SESSION_STORAGE_DIR):
+            try:
+                entries = os.listdir(SESSION_STORAGE_DIR)
+            except OSError as exc:
+                entries = [f"<listdir failed: {exc}>"]
+            logger.warning(
+                f"No persistent checkpoint at {persistent}; "
+                f"session storage dir {SESSION_STORAGE_DIR} contents={entries}"
+            )
+        else:
+            logger.warning(
+                f"Session storage unavailable, skip restore: {SESSION_STORAGE_DIR} "
+                f"(expected {persistent})"
+            )
+        return
+
+    if _checkpoint_db_ready(working_db):
+        if os.path.getmtime(persistent) <= os.path.getmtime(working_db):
+            logger.info(
+                f"Working checkpoint is newer, skip restore: working={working_db}, "
+                f"persistent={persistent}"
+            )
+            return
+
+    os.makedirs(os.path.dirname(working_db), exist_ok=True)
+    shutil.copy2(persistent, working_db)
+    for suffix in ("-wal", "-shm"):
+        src = persistent + suffix
+        if os.path.isfile(src):
+            shutil.copy2(src, working_db + suffix)
+    logger.info(f"Restored checkpoint DB from session storage: {persistent} -> {working_db}")
+
+
+async def persist_checkpoint_to_session_storage() -> None:
+    """Flush working checkpoint to session storage so history survives ECS task restarts."""
+    if _sqlite_checkpointer is None:
+        return
+
+    working_db = get_checkpoint_db_path()
+    persistent = get_persistent_checkpoint_db_path()
+    if working_db == persistent or not _checkpoint_db_ready(working_db):
+        return
+
+    os.makedirs(os.path.dirname(persistent), exist_ok=True)
+
+    try:
+        await _sqlite_checkpointer.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await _sqlite_checkpointer.conn.commit()
+
+        def _copy_checkpoint_files():
+            shutil.copy2(working_db, persistent)
+            for suffix in ("-wal", "-shm"):
+                src = working_db + suffix
+                dst = persistent + suffix
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                elif os.path.isfile(dst):
+                    os.remove(dst)
+
+        await asyncio.to_thread(_copy_checkpoint_files)
+        logger.info(f"Checkpoint persisted to session storage: {persistent}")
+    except Exception as exc:
+        logger.warning(f"Failed to persist checkpoint to session storage: {exc}")
+
+
+def _is_sqlite_locked_error(exc: BaseException) -> bool:
+    if isinstance(exc, sqlite3.OperationalError):
+        return "locked" in str(exc).lower()
+    cause = getattr(exc, "__cause__", None)
+    return isinstance(cause, sqlite3.OperationalError) and "locked" in str(cause).lower()
+
+
+def _checkpoint_db_ready(checkpoint_db: str) -> bool:
+    return os.path.isfile(checkpoint_db) and os.path.getsize(checkpoint_db) > 0
+
+
+async def _configure_sqlite_connection(conn) -> None:
+    await conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    await conn.commit()
+
+
+async def _open_existing_sqlite_checkpointer(checkpoint_db: str):
+    import aiosqlite
+
+    for attempt in range(1, _SETUP_MAX_ATTEMPTS + 1):
+        conn = None
+        try:
+            conn = await aiosqlite.connect(
+                checkpoint_db,
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+            )
+            await _configure_sqlite_connection(conn)
+            saver = AsyncSqliteSaver(conn)
+            saver.is_setup = True
+            return saver
+        except Exception as exc:
+            if conn is not None:
+                await conn.close()
+            if not _is_sqlite_locked_error(exc):
+                raise
+            if attempt == _SETUP_MAX_ATTEMPTS:
+                raise
+            delay = _SETUP_RETRY_BASE_SEC * (2 ** (attempt - 1))
+            logger.warning(
+                f"SQLite open locked (attempt {attempt}/{_SETUP_MAX_ATTEMPTS}), "
+                f"retrying in {delay:.2f}s"
+            )
+            await asyncio.sleep(delay)
+
+
+async def _create_sqlite_checkpointer(checkpoint_db: str):
+    import aiosqlite
+
+    for attempt in range(1, _SETUP_MAX_ATTEMPTS + 1):
+        conn = None
+        try:
+            conn = await aiosqlite.connect(
+                checkpoint_db,
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+            )
+            await _configure_sqlite_connection(conn)
+            saver = AsyncSqliteSaver(conn)
+            await saver.setup()
+            return saver
+        except Exception as exc:
+            if conn is not None:
+                await conn.close()
+            if not _is_sqlite_locked_error(exc):
+                raise
+            if attempt == _SETUP_MAX_ATTEMPTS:
+                raise
+            delay = _SETUP_RETRY_BASE_SEC * (2 ** (attempt - 1))
+            logger.warning(
+                f"SQLite checkpointer locked (attempt {attempt}/{_SETUP_MAX_ATTEMPTS}), "
+                f"retrying in {delay:.2f}s"
+            )
+            await asyncio.sleep(delay)
+
+
+def reset_checkpoint_state() -> None:
+    """Reset SQLite checkpointer state (e.g. on user switch or chat clear)."""
+    global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session
+    _sqlite_checkpointer = None
+    _sqlite_checkpointer_cm = None
+    _active_checkpoint_session = None
+    checkpointer = MemorySaver()
+
+
+async def ensure_checkpointer():
+    """Initialize AsyncSqliteSaver on local disk (per user/session)."""
+    global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session
+
+    session_id = _checkpoint_session_id()
+    checkpoint_db = get_checkpoint_db_path()
+
+    if _sqlite_checkpointer is not None and _active_checkpoint_session == session_id:
+        checkpointer = _sqlite_checkpointer
+        return checkpointer
+
+    if not SQLITE_CHECKPOINTER_AVAILABLE:
+        logger.info("Using in-memory checkpointer (langgraph-checkpoint-sqlite not installed)")
+        checkpointer = MemorySaver()
+        return checkpointer
+
+    async with _checkpointer_init_lock:
+        if _sqlite_checkpointer is not None and _active_checkpoint_session == session_id:
+            checkpointer = _sqlite_checkpointer
+            return checkpointer
+
+        _sqlite_checkpointer = None
+        _sqlite_checkpointer_cm = None
+        _active_checkpoint_session = session_id
+
+        try:
+            _restore_from_session_storage(checkpoint_db)
+            if _checkpoint_db_ready(checkpoint_db):
+                _sqlite_checkpointer = await _open_existing_sqlite_checkpointer(checkpoint_db)
+                logger.info(f"SQLite checkpointer opened (existing): {checkpoint_db}")
+            else:
+                _sqlite_checkpointer = await _create_sqlite_checkpointer(checkpoint_db)
+                logger.info(f"SQLite checkpointer initialized: {checkpoint_db}")
+        except Exception as exc:
+            logger.error(
+                f"SQLite checkpointer unavailable ({exc}); falling back to MemorySaver"
+            )
+            checkpointer = MemorySaver()
+            return checkpointer
+
+        checkpointer = _sqlite_checkpointer
+        return checkpointer
+
+
+map_chain = dict()
+checkpointers = dict()
+memorystores = dict()
 
 memory_chain = None
-checkpointer = MemorySaver()
 memorystore = InMemoryStore()
 
 def initiate():
-    global memory_chain, checkpointer, memorystore, checkpointers, memorystores
+    global memory_chain, memorystore, memorystores
 
     effective_user_id = user_id if user_id and str(user_id).strip() else "agent"
     logger.info(f"initiate for user_id: {effective_user_id}")
 
+    new_session = _checkpoint_session_id()
+    if new_session != _active_checkpoint_session:
+        reset_checkpoint_state()
+
     if effective_user_id in map_chain:
         logger.info(f"memory exist. reuse it!")
         memory_chain = map_chain[effective_user_id]
-
-        checkpointer = checkpointers[effective_user_id]
         memorystore = memorystores[effective_user_id]
     else:
         logger.info(f"memory not exist. create new memory!")
         memory_chain = SimpleMemory(k=5)
         map_chain[effective_user_id] = memory_chain
-
-        checkpointer = MemorySaver()
         memorystore = InMemoryStore()
-
-        checkpointers[effective_user_id] = checkpointer
         memorystores[effective_user_id] = memorystore
 
 def clear_chat_history():

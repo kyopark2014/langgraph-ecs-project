@@ -10,6 +10,8 @@ langchain_community
 langchain-openai
 openai>=2.41.0
 langgraph>=1.2.5
+langgraph-checkpoint-sqlite
+aiosqlite
 langgraph-supervisor>=0.0.31
 langgraph-swarm>=0.1.0
 langchain-text-splitters

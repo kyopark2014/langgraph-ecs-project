@@ -5,6 +5,8 @@ This script deletes all AWS infrastructure resources created by installer.py.
 """
 
 import boto3
+import json
+import os
 import time
 import logging
 import hashlib
@@ -29,6 +31,10 @@ opensearch_client = boto3.client("opensearchserverless", region_name=region)
 ec2_client = boto3.client("ec2", region_name=region)
 elbv2_client = boto3.client("elbv2", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
+ecs_client = boto3.client("ecs", region_name=region)
+ecr_client = boto3.client("ecr", region_name=region)
+logs_client = boto3.client("logs", region_name=region)
+s3files_client = boto3.client("s3files", region_name=region)
 bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
@@ -173,6 +179,62 @@ def delete_alb_resources():
         logger.info("✓ ALB resources deleted")
     except Exception as e:
         logger.error(f"Error deleting ALB resources: {e}")
+
+
+def delete_ecs_resources():
+    """Delete ECS cluster, service, task definitions, log group, and ECR repository."""
+    logger.info("[2.5/9] Deleting ECS resources")
+
+    cluster_name = f"cluster-for-{project_name}"
+    service_name = f"service-for-{project_name}"
+    log_group_name = f"/ecs/app-for-{project_name}"
+    repository_name = f"ecr-for-{project_name}"
+    task_family = f"task-for-{project_name}"
+
+    try:
+        services = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+        if services["services"] and services["services"][0]["status"] != "INACTIVE":
+            ecs_client.update_service(cluster=cluster_name, service=service_name, desiredCount=0)
+            logger.info(f"  ✓ Scaled ECS service to 0: {service_name}")
+            time.sleep(10)
+            ecs_client.delete_service(cluster=cluster_name, service=service_name, force=True)
+            logger.info(f"  ✓ Deleted ECS service: {service_name}")
+            time.sleep(15)
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ["ClusterNotFoundException", "ServiceNotFoundException"]:
+            logger.warning(f"  Could not delete ECS service: {e}")
+
+    try:
+        ecs_client.delete_cluster(cluster=cluster_name)
+        logger.info(f"  ✓ Deleted ECS cluster: {cluster_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ClusterNotFoundException":
+            logger.warning(f"  Could not delete ECS cluster: {e}")
+
+    try:
+        task_defs = ecs_client.list_task_definitions(familyPrefix=task_family, sort="DESC")
+        for task_def_arn in task_defs.get("taskDefinitionArns", []):
+            ecs_client.deregister_task_definition(taskDefinition=task_def_arn)
+            logger.info(f"  ✓ Deregistered task definition: {task_def_arn}")
+    except ClientError as e:
+        logger.warning(f"  Could not deregister task definitions: {e}")
+
+    try:
+        logs_client.delete_log_group(logGroupName=log_group_name)
+        logger.info(f"  ✓ Deleted log group: {log_group_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            logger.warning(f"  Could not delete log group: {e}")
+
+    try:
+        ecr_client.delete_repository(repositoryName=repository_name, force=True)
+        logger.info(f"  ✓ Deleted ECR repository: {repository_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "RepositoryNotFoundException":
+            logger.warning(f"  Could not delete ECR repository: {e}")
+
+    logger.info("✓ ECS resources deleted")
+
 
 def delete_nat_gateways():
     """Delete NAT gateways and their associated routes."""
@@ -1619,9 +1681,12 @@ def delete_iam_roles(delete_agentcore_gateway_role: bool = True):
     role_names = [
         f"role-knowledge-base-for-{project_name}-{region}",
         f"role-agent-for-{project_name}-{region}",
+        f"role-ecs-task-for-{project_name}-{region}",
+        f"role-ecs-execution-for-{project_name}-{region}",
         f"role-ec2-for-{project_name}-{region}",
         f"role-lambda-rag-for-{project_name}-{region}",
         f"role-agentcore-memory-for-{project_name}-{region}",
+        f"role-s3files-sync-for-{project_name}",
     ]
     if delete_agentcore_gateway_role:
         role_names.append(f"role-agentcore-gateway-websearch-for-{project_name}")
@@ -1769,6 +1834,185 @@ def retry_vpc_deletion():
     except Exception as e:
         logger.error(f"Error during VPC deletion retry: {e}")
 
+
+def _application_config_path() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, "application", "config.json")
+
+
+def _load_application_config() -> dict:
+    config_path = _application_config_path()
+    if not os.path.isfile(config_path):
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(f"  Could not read {config_path}: {exc}")
+        return {}
+
+
+def _is_s3files_not_found(error: ClientError) -> bool:
+    code = error.response.get("Error", {}).get("Code", "")
+    return code in {"ResourceNotFoundException", "NotFoundException", "NoSuchResource"}
+
+
+def _wait_for_s3files_resource_deleted(
+    describe_fn,
+    resource_id_key: str,
+    resource_id: str,
+    max_wait_seconds: int = 600,
+    poll_seconds: int = 10,
+) -> bool:
+    """Poll until describe returns not-found (resource fully deleted)."""
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
+        try:
+            response = describe_fn(**{resource_id_key: resource_id})
+            status = (response.get("status") or "").lower()
+            if status in {"deleted", "deleting"}:
+                time.sleep(poll_seconds)
+                continue
+        except ClientError as error:
+            if _is_s3files_not_found(error):
+                return True
+            raise
+        time.sleep(poll_seconds)
+    logger.warning(f"  Timed out waiting for S3 Files resource deletion: {resource_id}")
+    return False
+
+
+def _find_s3files_file_system_id_for_bucket(s3_bucket_arn: str) -> str:
+    paginator = s3files_client.get_paginator("list_file_systems")
+    for page in paginator.paginate():
+        for item in page.get("fileSystems", []):
+            if item.get("bucket") == s3_bucket_arn:
+                return item.get("fileSystemId", "") or ""
+    return ""
+
+
+def _resolve_s3files_file_system_id() -> str:
+    app_config = _load_application_config()
+    file_system_id = app_config.get("s3_files_file_system_id") or ""
+    if file_system_id:
+        return file_system_id
+    return _find_s3files_file_system_id_for_bucket(f"arn:aws:s3:::{bucket_name}")
+
+
+def _delete_s3files_sync_role() -> None:
+    role_name = f"role-s3files-sync-for-{project_name}"
+    try:
+        inline_policies = iam_client.list_role_policies(RoleName=role_name)
+        for policy_name in inline_policies.get("PolicyNames", []):
+            iam_client.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+        iam_client.delete_role(RoleName=role_name)
+        logger.info(f"  ✓ Deleted S3 Files sync role: {role_name}")
+    except ClientError as error:
+        if error.response["Error"]["Code"] != "NoSuchEntity":
+            logger.warning(f"  Could not delete S3 Files sync role {role_name}: {error}")
+
+
+def delete_s3_files_session_storage() -> None:
+    """Delete S3 Files resources created for ECS session storage at /mnt/workspace."""
+    logger.info("[3.6/9] Deleting S3 Files session storage")
+
+    file_system_id = _resolve_s3files_file_system_id()
+    if not file_system_id:
+        logger.info("  No S3 Files file system found for this deployment")
+        _delete_s3files_sync_role()
+        logger.info("✓ S3 Files session storage processed")
+        return
+
+    logger.info(f"  File system: {file_system_id}")
+
+    try:
+        s3files_client.delete_file_system_policy(fileSystemId=file_system_id)
+        logger.info("  ✓ Deleted S3 Files file system policy")
+    except ClientError as error:
+        if not _is_s3files_not_found(error):
+            logger.warning(f"  Could not delete S3 Files file system policy: {error}")
+
+    access_point_ids = []
+    try:
+        paginator = s3files_client.get_paginator("list_access_points")
+        for page in paginator.paginate(fileSystemId=file_system_id):
+            for item in page.get("accessPoints", []):
+                access_point_id = item.get("accessPointId")
+                if access_point_id:
+                    access_point_ids.append(access_point_id)
+    except ClientError as error:
+        logger.warning(f"  Could not list S3 Files access points: {error}")
+
+    for access_point_id in access_point_ids:
+        try:
+            s3files_client.delete_access_point(accessPointId=access_point_id)
+            _wait_for_s3files_resource_deleted(
+                s3files_client.get_access_point,
+                "accessPointId",
+                access_point_id,
+            )
+            logger.info(f"  ✓ Deleted S3 Files access point: {access_point_id}")
+        except ClientError as error:
+            if not _is_s3files_not_found(error):
+                logger.warning(f"  Could not delete access point {access_point_id}: {error}")
+
+    mount_target_ids = []
+    try:
+        paginator = s3files_client.get_paginator("list_mount_targets")
+        for page in paginator.paginate(fileSystemId=file_system_id):
+            for item in page.get("mountTargets", []):
+                mount_target_id = item.get("mountTargetId")
+                if mount_target_id:
+                    mount_target_ids.append(mount_target_id)
+    except ClientError as error:
+        logger.warning(f"  Could not list S3 Files mount targets: {error}")
+
+    for mount_target_id in mount_target_ids:
+        try:
+            s3files_client.delete_mount_target(mountTargetId=mount_target_id)
+            _wait_for_s3files_resource_deleted(
+                s3files_client.get_mount_target,
+                "mountTargetId",
+                mount_target_id,
+            )
+            logger.info(f"  ✓ Deleted S3 Files mount target: {mount_target_id}")
+        except ClientError as error:
+            if not _is_s3files_not_found(error):
+                logger.warning(f"  Could not delete mount target {mount_target_id}: {error}")
+
+    try:
+        s3files_client.delete_file_system(fileSystemId=file_system_id, forceDelete=True)
+        _wait_for_s3files_resource_deleted(
+            s3files_client.get_file_system,
+            "fileSystemId",
+            file_system_id,
+        )
+        logger.info(f"  ✓ Deleted S3 Files file system: {file_system_id}")
+    except ClientError as error:
+        if not _is_s3files_not_found(error):
+            logger.warning(f"  Could not delete S3 Files file system {file_system_id}: {error}")
+
+    _delete_s3files_sync_role()
+    logger.info("✓ S3 Files session storage deleted")
+
+
+def delete_local_config_files() -> None:
+    """Remove local config files written by installer."""
+    logger.info("[9/9] Deleting local config files")
+
+    config_path = _application_config_path()
+    try:
+        if os.path.exists(config_path):
+            os.remove(config_path)
+            logger.info(f"  ✓ Deleted {config_path}")
+        else:
+            logger.info(f"  Config not found (may already be deleted): {config_path}")
+    except OSError as error:
+        logger.warning(f"  Could not delete {config_path}: {error}")
+
+    logger.info("✓ Local config files processed")
+
+
 def main():
     """Main function to delete all infrastructure."""
     logger.info("="*60)
@@ -1779,7 +2023,7 @@ def main():
     logger.info(f"Account ID: {account_id}")
     logger.info("="*60)
 
-    parser = argparse.ArgumentParser(description="AgentCore Runtime Uninstaller")
+    parser = argparse.ArgumentParser(description="AWS Infrastructure Uninstaller")
     parser.add_argument(
         "--yes",
         action="store_true",
@@ -1809,19 +2053,21 @@ def main():
     
     try:
         delete_cloudfront_distributions()
+        delete_ecs_resources()
         delete_alb_resources()
         delete_ec2_instances()
         delete_nat_gateways()
-        
+        delete_s3_files_session_storage()
+
         # Wait for VPC endpoints to be deleted first
         wait_for_vpc_endpoint_deletion()
         delete_vpc_endpoints_and_wait()
-        
+
         delete_security_groups()
         delete_route_tables()
-        
+
         failed_vpcs = delete_vpc_resources()
-        
+
         delete_opensearch_collection()
         delete_knowledge_bases()
         agentcore_gateway_deleted = delete_agentcore_websearch_gateway(
@@ -1831,6 +2077,7 @@ def main():
         delete_iam_roles(delete_agentcore_gateway_role=agentcore_gateway_deleted)
         delete_s3_buckets()
         delete_disabled_cloudfront_distributions()
+        delete_local_config_files()
         
         # Retry VPC deletion only if there were failures
         if failed_vpcs:

@@ -1073,8 +1073,9 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
     if not tools:
         logger.warning("No tools available, using general conversation mode")
         return None, None
-    
+
     if history_mode == "Enable":
+        await chat.ensure_checkpointer()
         app = buildChatAgentWithHistory(tools)
         config = {
             "recursion_limit": 500,
@@ -1129,87 +1130,91 @@ async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, h
     result = ""
     tool_used = False  # Track if tool was used
     tool_name = toolUseId = ""
-    async for stream in app.astream(inputs, config, stream_mode="messages"):
-        if isinstance(stream[0], AIMessageChunk):
-            message = stream[0]    
-            input = {}        
-            if isinstance(message.content, list):
-                for content_item in message.content:
-                    if isinstance(content_item, dict):
-                        if content_item.get('type') == 'text':
-                            text_content = content_item.get('text', '')
-                            # logger.info(f"text_content: {text_content}")
+    try:
+        async for stream in app.astream(inputs, config, stream_mode="messages"):
+            if isinstance(stream[0], AIMessageChunk):
+                message = stream[0]    
+                input = {}        
+                if isinstance(message.content, list):
+                    for content_item in message.content:
+                        if isinstance(content_item, dict):
+                            if content_item.get('type') == 'text':
+                                text_content = content_item.get('text', '')
+                                # logger.info(f"text_content: {text_content}")
+                                
+                                # If tool was used, start fresh result
+                                if tool_used:
+                                    result = text_content
+                                    tool_used = False
+                                else:
+                                    result += text_content
+                                    
+                                # logger.info(f"result: {result}")                
+                                if chat.debug_mode == "Enable" and queue:
+                                    chat.update_streaming_result(notification_queue, result, "markdown")
+
+                            elif content_item.get('type') == 'tool_use':
+                                # logger.info(f"content_item: {content_item}")      
+                                if 'id' in content_item and 'name' in content_item:
+                                    toolUseId = content_item.get('id', '')
+                                    tool_name = content_item.get('name', '')
+                                    logger.info(f"tool_name: {tool_name}, toolUseId: {toolUseId}")
+                                    if queue:
+                                        queue.register_tool(toolUseId, tool_name)
+                                                                        
+                                if 'partial_json' in content_item:
+                                    partial_json = content_item.get('partial_json', '')
+                                    
+                                    if toolUseId not in chat.tool_input_list:
+                                        chat.tool_input_list[toolUseId] = ""                                
+                                    chat.tool_input_list[toolUseId] += partial_json
+                                    input = chat.tool_input_list[toolUseId]
+
+                                    if queue:
+                                        queue.tool_update(toolUseId, f"Tool: {tool_name}, Input: {input}")
                             
-                            # If tool was used, start fresh result
-                            if tool_used:
-                                result = text_content
-                                tool_used = False
-                            else:
-                                result += text_content
-                                
-                            # logger.info(f"result: {result}")                
-                            if chat.debug_mode == "Enable" and queue:
-                                chat.update_streaming_result(notification_queue, result, "markdown")
+            elif isinstance(stream[0], ToolMessage):
+                message = stream[0]
+                logger.info(f"ToolMessage: {message.name}, {message.content}")
+                tool_name = message.name
+                toolResult = message.content
+                toolUseId = message.tool_call_id
+                logger.info(f"toolResult: {toolResult}, toolUseId: {toolUseId}")
+                if chat.debug_mode == "Enable":
+                    chat.add_notification(notification_queue, f"Tool Result: {toolResult}")
+                tool_used = True
+                
+                tool_content, tool_urls, refs = chat.get_tool_info(tool_name, toolResult)
+                if refs:
+                    for r in refs:
+                        references.append(r)
+                    logger.info(f"refs: {refs}")
+                if tool_urls:
+                    for url in tool_urls:
+                        artifacts.append(url)
+                    logger.info(f"tool_urls: {tool_urls}")
 
-                        elif content_item.get('type') == 'tool_use':
-                            # logger.info(f"content_item: {content_item}")      
-                            if 'id' in content_item and 'name' in content_item:
-                                toolUseId = content_item.get('id', '')
-                                tool_name = content_item.get('name', '')
-                                logger.info(f"tool_name: {tool_name}, toolUseId: {toolUseId}")
-                                if queue:
-                                    queue.register_tool(toolUseId, tool_name)
-                                                                    
-                            if 'partial_json' in content_item:
-                                partial_json = content_item.get('partial_json', '')
-                                
-                                if toolUseId not in chat.tool_input_list:
-                                    chat.tool_input_list[toolUseId] = ""                                
-                                chat.tool_input_list[toolUseId] += partial_json
-                                input = chat.tool_input_list[toolUseId]
+                if isinstance(toolResult, str):
+                    if "[artifacts]" in toolResult:
+                        for line in toolResult.split("[artifacts]")[-1].strip().split("\n"):
+                            line = line.strip()
+                            if line and os.path.isfile(line):
+                                artifact_paths.append(line)
+                        logger.info(f"artifact_paths from text: {artifact_paths}")
 
-                                if queue:
-                                    queue.tool_update(toolUseId, f"Tool: {tool_name}, Input: {input}")
-                        
-        elif isinstance(stream[0], ToolMessage):
-            message = stream[0]
-            logger.info(f"ToolMessage: {message.name}, {message.content}")
-            tool_name = message.name
-            toolResult = message.content
-            toolUseId = message.tool_call_id
-            logger.info(f"toolResult: {toolResult}, toolUseId: {toolUseId}")
-            if chat.debug_mode == "Enable":
-                chat.add_notification(notification_queue, f"Tool Result: {toolResult}")
-            tool_used = True
-            
-            tool_content, tool_urls, refs = chat.get_tool_info(tool_name, toolResult)
-            if refs:
-                for r in refs:
-                    references.append(r)
-                logger.info(f"refs: {refs}")
-            if tool_urls:
-                for url in tool_urls:
-                    artifacts.append(url)
-                logger.info(f"tool_urls: {tool_urls}")
+                    if tool_name == "write_file" and toolResult.startswith("File saved:"):
+                        saved = toolResult.split("File saved:", 1)[1].strip()
+                        if not os.path.isabs(saved):
+                            saved = os.path.join(WORKING_DIR, saved)
+                        if os.path.isfile(saved) and os.path.abspath(saved).startswith(os.path.abspath(ARTIFACTS_DIR)):
+                            artifact_paths.append(saved)
+                            logger.info(f"artifact_paths from write_file: {saved}")
 
-            if isinstance(toolResult, str):
-                if "[artifacts]" in toolResult:
-                    for line in toolResult.split("[artifacts]")[-1].strip().split("\n"):
-                        line = line.strip()
-                        if line and os.path.isfile(line):
-                            artifact_paths.append(line)
-                    logger.info(f"artifact_paths from text: {artifact_paths}")
-
-                if tool_name == "write_file" and toolResult.startswith("File saved:"):
-                    saved = toolResult.split("File saved:", 1)[1].strip()
-                    if not os.path.isabs(saved):
-                        saved = os.path.join(WORKING_DIR, saved)
-                    if os.path.isfile(saved) and os.path.abspath(saved).startswith(os.path.abspath(ARTIFACTS_DIR)):
-                        artifact_paths.append(saved)
-                        logger.info(f"artifact_paths from write_file: {saved}")
-
-            if tool_content:
-                logger.info(f"content: {tool_content}")        
+                if tool_content:
+                    logger.info(f"content: {tool_content}")        
+    finally:
+        if history_mode == "Enable":
+            await chat.persist_checkpoint_to_session_storage()
     
     if not result:
         result = "답변을 찾지 못하였습니다."        

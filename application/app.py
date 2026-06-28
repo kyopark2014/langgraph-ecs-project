@@ -255,7 +255,8 @@ st.title('🔮 '+ mode)
 if clear_button==True:    
     chat.map_chain = dict() 
     chat.checkpointers = dict() 
-    chat.memorystores = dict() 
+    chat.memorystores = dict()
+    chat.reset_checkpoint_state()
     chat.initiate()
 
 # Preview the uploaded image in the sidebar
