@@ -1,4 +1,4 @@
-# ECS에서 Agent 활용하기 — AgentCore Memory
+# ECS에서 LangGraph로 Agent 활용하기 
 
 Agent는 MCP뿐 아니라 [Skill](https://github.com/anthropics/skills)을 활용하여 다양한 기능을 편리하게 구현할 수 있으며, [LangGraph](https://www.langchain.com/langgraph)로 구현한 Agent를 ECS Fargate에 배포하여 활용합니다. CloudFront → ALB → ECS Fargate로 Streamlit을 제공하고, User ID별로 대화·메모리를 분리합니다.
 
