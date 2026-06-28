@@ -1,6 +1,6 @@
 # ECS에서 LangGraph로 Agent 활용하기 
 
-[Amazon Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-getting-started.html)를 활용하여 LangGraph Agent에서 단기/장기 메모리를 구현합니다. Agent는 MCP뿐 아니라 [Skill](https://github.com/anthropics/skills)을 활용하여 다양한 기능을 편리하게 구현할 수 있으며, [LangGraph](https://www.langchain.com/langgraph)로 구현한 Agent를 ECS Fargate에 배포하여 활용합니다. CloudFront → ALB → ECS Fargate로 Streamlit을 제공하고, User ID별로 대화·메모리를 분리합니다. **Agent (Chat)** 모드의 LangGraph checkpoint는 **Amazon S3 Files**를 `/mnt/workspace`에 마운트하여 ECS 태스크 재시작 후에도 유지합니다.
+Agent는 MCP뿐 아니라 [Skill](https://github.com/anthropics/skills)을 활용하여 다양한 기능을 편리하게 구현할 수 있으며, [LangGraph](https://www.langchain.com/langgraph)로 구현한 Agent를 ECS Fargate에 배포하여 활용합니다. CloudFront → ALB → ECS Fargate로 Streamlit을 제공하고, User ID별로 대화·메모리를 분리합니다. **Agent (Chat)** 모드의 LangGraph checkpoint는 **Amazon S3 Files**를 `/mnt/workspace`에 마운트하여 ECS 태스크 재시작 후에도 유지합니다.
 
 전체 인프라는 [installer.py](./installer.py)로 자동 배포합니다. Agent는 MCP와 skill을 함께 활용하여 RAG, 웹 검색, 문서 처리 등 다양한 작업을 수행할 수 있습니다.
 
