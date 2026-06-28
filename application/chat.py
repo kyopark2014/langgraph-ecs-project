@@ -2,6 +2,7 @@ import traceback
 import asyncio
 import shutil
 import sqlite3
+import threading
 import boto3
 import os
 import json
@@ -169,7 +170,8 @@ checkpointer = MemorySaver()
 _sqlite_checkpointer = None
 _sqlite_checkpointer_cm = None
 _active_checkpoint_session = None
-_checkpointer_init_lock = asyncio.Lock()
+_checkpointer_loop = None
+_checkpointer_init_lock = threading.Lock()
 SQLITE_BUSY_TIMEOUT_MS = 5000
 _SETUP_MAX_ATTEMPTS = 5
 _SETUP_RETRY_BASE_SEC = 0.25
@@ -359,39 +361,63 @@ async def _create_sqlite_checkpointer(checkpoint_db: str):
             await asyncio.sleep(delay)
 
 
+async def _close_sqlite_checkpointer() -> None:
+    """Close the active SQLite checkpointer connection if any."""
+    global _sqlite_checkpointer, _sqlite_checkpointer_cm, _checkpointer_loop
+    if _sqlite_checkpointer is None:
+        return
+    try:
+        conn = getattr(_sqlite_checkpointer, "conn", None)
+        if conn is not None:
+            await conn.close()
+    except Exception as exc:
+        logger.warning(f"Error closing sqlite checkpointer: {exc}")
+    _sqlite_checkpointer = None
+    _sqlite_checkpointer_cm = None
+    _checkpointer_loop = None
+
+
 def reset_checkpoint_state() -> None:
     """Reset SQLite checkpointer state (e.g. on user switch or chat clear)."""
-    global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session
+    global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session, _checkpointer_loop
     _sqlite_checkpointer = None
     _sqlite_checkpointer_cm = None
     _active_checkpoint_session = None
+    _checkpointer_loop = None
     checkpointer = MemorySaver()
 
 
 async def ensure_checkpointer():
     """Initialize AsyncSqliteSaver on local disk (per user/session)."""
-    global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session
+    global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session, _checkpointer_loop
 
     session_id = _checkpoint_session_id()
     checkpoint_db = get_checkpoint_db_path()
+    loop = asyncio.get_running_loop()
 
     if _sqlite_checkpointer is not None and _active_checkpoint_session == session_id:
-        checkpointer = _sqlite_checkpointer
-        return checkpointer
+        if _checkpointer_loop is loop:
+            checkpointer = _sqlite_checkpointer
+            return checkpointer
+        logger.info("Event loop changed; recreating SQLite checkpointer")
+        await _close_sqlite_checkpointer()
 
     if not SQLITE_CHECKPOINTER_AVAILABLE:
         logger.info("Using in-memory checkpointer (langgraph-checkpoint-sqlite not installed)")
         checkpointer = MemorySaver()
         return checkpointer
 
-    async with _checkpointer_init_lock:
+    with _checkpointer_init_lock:
         if _sqlite_checkpointer is not None and _active_checkpoint_session == session_id:
-            checkpointer = _sqlite_checkpointer
-            return checkpointer
+            if _checkpointer_loop is loop:
+                checkpointer = _sqlite_checkpointer
+                return checkpointer
+            await _close_sqlite_checkpointer()
 
         _sqlite_checkpointer = None
         _sqlite_checkpointer_cm = None
         _active_checkpoint_session = session_id
+        _checkpointer_loop = None
 
         try:
             _restore_from_session_storage(checkpoint_db)
@@ -408,6 +434,7 @@ async def ensure_checkpointer():
             checkpointer = MemorySaver()
             return checkpointer
 
+        _checkpointer_loop = loop
         checkpointer = _sqlite_checkpointer
         return checkpointer
 

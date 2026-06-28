@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+import asyncio
 import subprocess
 import traceback
 import chat
@@ -1099,10 +1100,12 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
 app = config = None
 active_mcp_servers = []
 active_skills = []
+active_history_mode = None
+active_loop_id = None
 current_id = None
 
 async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, history_mode: str="Disable", notification_queue: NotificationQueue =None) -> tuple[str, list]:
-    global app, config, active_mcp_servers, active_skills, current_id
+    global app, config, active_mcp_servers, active_skills, active_history_mode, active_loop_id, current_id
     
     queue = notification_queue if notification_queue else None
     if queue:
@@ -1112,10 +1115,21 @@ async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, h
     artifact_paths = []
     references = []
 
-    if app is None or active_mcp_servers != mcp_servers or active_skills != skill_list or current_id != chat.user_id:
+    loop_id = id(asyncio.get_running_loop())
+    if (
+        app is None
+        or active_mcp_servers != mcp_servers
+        or active_skills != skill_list
+        or active_history_mode != history_mode
+        or current_id != chat.user_id
+        or (history_mode == "Enable" and active_loop_id != loop_id)
+    ):
         active_mcp_servers = mcp_servers
         active_skills = skill_list
+        active_history_mode = history_mode
         current_id = chat.user_id
+        if history_mode == "Enable":
+            active_loop_id = loop_id
 
         app, config = await create_agent(mcp_servers, skill_list, history_mode)
     
