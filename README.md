@@ -556,44 +556,6 @@ python uninstaller.py
 상세한 installer 동작은 [installer.md](./installer.md)를 참조하세요.
 
 
-### Local에서 실행하기
-
-AWS 환경을 잘 활용하기 위해서는 [AWS CLI를 설치](https://docs.aws.amazon.com/ko_kr/cli/v1/userguide/cli-chap-install.html)하여야 합니다. Local에 설치시는 아래 명령어를 참조합니다.
-
-```text
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-sudo ./aws/install
-```
-
-AWS credential을 아래와 같이 AWS CLI를 이용해 등록합니다.
-
-```text
-aws configure
-```
-
-venv로 환경을 구성하면 편리하게 패키지를 관리합니다.
-
-```text
-python -m venv .venv
-source .venv/bin/activate
-```
-
-이후 다운로드 받은 github 폴더로 이동한 후에 아래와 같이 필요한 패키지를 추가로 설치 합니다.
-
-```text
-pip install -r requirements.txt
-```
-
-installer로 AgentCore Memory와 Knowledge Base를 먼저 프로비저닝한 뒤, 아래와 같이 streamlit을 실행합니다.
-
-```text
-streamlit run application/app.py
-```
-
-앱 시작 시 User ID를 입력하고, **Agent (Chat)** 모드에서 Memory를 켠 상태로 대화하면 AgentCore Memory에 저장됩니다. 로컬에는 `/mnt/workspace`가 없으므로 LangGraph checkpoint는 `application/.session_storage/{user_id}/`에 저장되며, ECS와 동일한 checkpointer·persist 로직이 적용됩니다.
-
-
 ### MCP
 
 Plugin의 Connector는 MCP를 이용해 구현합니다. Memory 관련 MCP는 아래와 같습니다.
