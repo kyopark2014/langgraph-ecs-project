@@ -35,7 +35,7 @@ def main() -> int:
         success, message = bedrock_data_retention.get_data_retention_mode(region=args.region)
     elif args.all_fable_regions:
         success = bedrock_data_retention.ensure_fable_data_retention(
-            "global.anthropic.claude-fable-5",
+            "us.anthropic.claude-fable-5",
             bedrock_region=args.region,
         )
         message = "configured all Fable bedrock regions" if success else "one or more regions failed"
