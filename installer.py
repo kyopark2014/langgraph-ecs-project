@@ -3591,6 +3591,8 @@ def build_and_push_docker_image(repository_uri: str, image_tag: str = "latest") 
             "docker", "build",
             "--progress=plain",
             "--platform", "linux/amd64",
+            "--provenance=false",
+            "--sbom=false",
             "-t", image_uri,
             ".",
         ],
