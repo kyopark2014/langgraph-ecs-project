@@ -4424,34 +4424,32 @@ def deploy_ecs_service(
 
     cluster_name = cluster_arn.split("/")[-1]
     service_arn = None
-    try:
-        services = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
-        if services["services"] and services["services"][0]["status"] != "INACTIVE":
-            service_arn = services["services"][0]["serviceArn"]
-            logger.warning(f"  ECS service already exists: {service_name}")
-            ecs_client.update_service(
-                cluster=cluster_name,
-                service=service_name,
-                taskDefinition=task_definition_arn,
-                desiredCount=1,
-                networkConfiguration=network_configuration,
-                loadBalancers=[
-                    {
-                        "targetGroupArn": tg_arn,
-                        "containerName": container_name,
-                        "containerPort": 8501,
-                    }
-                ],
-                forceNewDeployment=True,
-            )
-            logger.info(
-                "  ✓ Updated ECS service with task definition, network, and load balancer"
-            )
-            logger.info(
-                f"    subnets={private_subnets}, security_group={vpc_info['ecs_sg_id']}"
-            )
-    except ClientError:
-        pass
+    services = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+    service_list = services.get("services") or []
+    if service_list and service_list[0].get("status") != "INACTIVE":
+        service_arn = service_list[0]["serviceArn"]
+        logger.warning(f"  ECS service already exists: {service_name}")
+        ecs_client.update_service(
+            cluster=cluster_name,
+            service=service_name,
+            taskDefinition=task_definition_arn,
+            desiredCount=1,
+            networkConfiguration=network_configuration,
+            loadBalancers=[
+                {
+                    "targetGroupArn": tg_arn,
+                    "containerName": container_name,
+                    "containerPort": 8501,
+                }
+            ],
+            forceNewDeployment=True,
+        )
+        logger.info(
+            "  ✓ Updated ECS service with task definition, network, and load balancer"
+        )
+        logger.info(
+            f"    subnets={private_subnets}, security_group={vpc_info['ecs_sg_id']}"
+        )
 
     if not service_arn:
         service_response = ecs_client.create_service(
