@@ -1,0 +1,14 @@
+{
+  "MCP": [
+    "long term memory",
+    "web_fetch",
+    "slack",
+    "notion",
+    "korea_weather",
+    "websearch"
+  ],
+  "SKILL": [
+    "skill-creator",
+    "graphify"
+  ]
+}
