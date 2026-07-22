@@ -1674,7 +1674,79 @@ def delete_agentcore_websearch_gateway(skip_confirmation: bool = False) -> bool:
         logger.error(f"Error deleting AgentCore Web Search gateway: {e}")
         return False
 
-def delete_iam_roles(delete_agentcore_gateway_role: bool = True):
+def delete_agentcore_memory(skip_confirmation: bool = False) -> bool:
+    """Delete AgentCore Memory for this project.
+
+    Returns True when memory was deleted or did not exist.
+    Returns False when the user declined deletion or deletion failed.
+    """
+    logger.info("[6.6/9] Deleting AgentCore Memory")
+
+    memory_name = project_name.replace("-", "_")
+    memory_id = None
+
+    try:
+        # Prefer memory_id from application/config.json
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "application", "config.json"
+        )
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+            memory_id = config_data.get("memory_id")
+            if memory_id:
+                logger.info(f"  Found memory_id in config.json: {memory_id}")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        from bedrock_agentcore.memory import MemoryClient
+
+        memory_client = MemoryClient(region_name=region)
+        if not memory_id:
+            memories = memory_client.list_memories()
+            for memory in memories:
+                mid = memory.get("id", "")
+                if mid.split("-")[0] == memory_name:
+                    memory_id = mid
+                    logger.info(f"  Found memory by name: {memory_id}")
+                    break
+
+        if not memory_id:
+            logger.info(f"  AgentCore Memory not found for project: {project_name}")
+            return True
+
+        if not skip_confirmation:
+            print("\n" + "=" * 60)
+            print(f"AgentCore Memory '{memory_id}' in {region} will be deleted.")
+            print("This removes long-term memory records for this project.")
+            print("=" * 60)
+            response = input(
+                "\nDelete AgentCore Memory? (yes/no) [no]: "
+            ).strip().lower()
+            if response != "yes":
+                logger.info(
+                    "  Skipping AgentCore Memory deletion (default: no)."
+                )
+                return False
+
+        memory_client.delete_memory_and_wait(memory_id)
+        logger.info(f"  ✓ Deleted AgentCore Memory: {memory_id}")
+        return True
+    except Exception as e:
+        error_code = ""
+        if isinstance(e, ClientError):
+            error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("ResourceNotFoundException", "ValidationException"):
+            logger.info(f"  AgentCore Memory already deleted or not found: {memory_id}")
+            return True
+        logger.warning(f"  Could not delete AgentCore Memory: {e}")
+        return False
+
+
+def delete_iam_roles(
+    delete_agentcore_gateway_role: bool = True,
+    delete_agentcore_memory_role: bool = True,
+):
     """Delete IAM roles and policies."""
     logger.info("[7/9] Deleting IAM roles")
     
@@ -1685,9 +1757,15 @@ def delete_iam_roles(delete_agentcore_gateway_role: bool = True):
         f"role-ecs-execution-for-{project_name}-{region}",
         f"role-ec2-for-{project_name}-{region}",
         f"role-lambda-rag-for-{project_name}-{region}",
-        f"role-agentcore-memory-for-{project_name}-{region}",
         f"role-s3files-sync-for-{project_name}",
     ]
+    if delete_agentcore_memory_role:
+        role_names.append(f"role-agentcore-memory-for-{project_name}-{region}")
+    else:
+        logger.info(
+            "  Keeping AgentCore Memory IAM role "
+            f"(role-agentcore-memory-for-{project_name}-{region})"
+        )
     if delete_agentcore_gateway_role:
         role_names.append(f"role-agentcore-gateway-websearch-for-{project_name}")
     else:
@@ -2037,6 +2115,14 @@ def main():
             "(default: ask, default answer no)"
         ),
     )
+    parser.add_argument(
+        "--delete-agentcore-memory",
+        action="store_true",
+        help=(
+            "Delete AgentCore Memory without a separate confirmation prompt "
+            "(default: ask, default answer no)"
+        ),
+    )
     
     args = parser.parse_args()
 
@@ -2073,8 +2159,14 @@ def main():
         agentcore_gateway_deleted = delete_agentcore_websearch_gateway(
             skip_confirmation=args.delete_agentcore_gateway
         )
+        agentcore_memory_deleted = delete_agentcore_memory(
+            skip_confirmation=args.delete_agentcore_memory
+        )
         delete_secrets()
-        delete_iam_roles(delete_agentcore_gateway_role=agentcore_gateway_deleted)
+        delete_iam_roles(
+            delete_agentcore_gateway_role=agentcore_gateway_deleted,
+            delete_agentcore_memory_role=agentcore_memory_deleted,
+        )
         delete_s3_buckets()
         delete_disabled_cloudfront_distributions()
         delete_local_config_files()
