@@ -4169,12 +4169,46 @@ def _get_or_create_s3files_access_point(file_system_id: str) -> str:
     return access_point_arn
 
 
+def _iam_role_name_from_arn(role_arn: str) -> str:
+    """Extract the IAM role name from a role ARN (last path segment)."""
+    if ":role/" in role_arn:
+        return role_arn.rsplit("/", 1)[-1]
+    return role_arn
+
+
+def _iam_role_exists(role_arn: str) -> bool:
+    """Return True if the IAM role ARN resolves to an existing role."""
+    if not role_arn:
+        return False
+    role_name = _iam_role_name_from_arn(role_arn)
+    try:
+        iam_client.get_role(RoleName=role_name)
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+            return False
+        logger.warning(f"  Could not verify IAM role {role_name}: {e}")
+        return False
+
+
 def _ensure_s3files_file_system_policy(
     file_system_id: str,
     access_point_arn: str,
     client_role_arn: str,
 ) -> None:
     """Allow the ECS task role to mount and write via the access point."""
+    if not client_role_arn:
+        return
+
+    # PutFileSystemPolicy rejects Principal ARNs for roles that do not exist yet
+    # (same validation as S3 bucket policies).
+    if not _iam_role_exists(client_role_arn):
+        logger.info(
+            "  Deferring S3 Files file system policy: IAM role not found yet (%s)",
+            _iam_role_name_from_arn(client_role_arn),
+        )
+        return
+
     policy = {
         "Version": "2012-10-17",
         "Statement": [
