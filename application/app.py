@@ -187,6 +187,7 @@ with st.sidebar:
             "Claude 5.0 Opus",
             "Claude 4.6 Sonnet",
             "Claude Fable 5",
+    "Claude Fable 5.1",
             "Claude 4.8 Opus",
             "Claude 4.7 Opus",            
             "Claude 4.6 Opus",
