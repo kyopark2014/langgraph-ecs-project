@@ -6,7 +6,7 @@ import agentcore_memory
 import utils
 
 from typing import Dict, Optional, Any
-from mcp.server.fastmcp import FastMCP 
+from mcp.server.mcpserver import MCPServer 
 from bedrock_agentcore.memory import MemoryClient
 
 logging.basicConfig(
@@ -36,7 +36,7 @@ accountId = config['accountId']
 projectName = config['projectName']
 
 try:
-    mcp = FastMCP(
+    mcp = MCPServer(
         name = "short-term memory"
     )
     logger.info("MCP server initialized successfully")
